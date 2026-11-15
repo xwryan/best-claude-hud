@@ -1,0 +1,11 @@
+/target
+/npm-publish
+/npm-tarballs
+/release-artifacts
+/result
+/result-*
+.DS_Store
+
+# Documentation and development files
+claude-powerline-features.md
+PRD.md

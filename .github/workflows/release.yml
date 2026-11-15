@@ -1,0 +1,250 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to package, for example 0.1.0"
+        required: false
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  validate-version:
+    name: Validate release version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.release-version.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Match tag, Cargo, lockfile, and npm versions
+        id: release-version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${{ inputs.version }}" ]; then
+            VERSION="${{ inputs.version }}"
+          elif [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            echo "A version input is required outside a v* tag build." >&2
+            exit 1
+          fi
+          VERSION="${VERSION#v}"
+
+          CARGO_VERSION="$(
+            cargo metadata --locked --no-deps --format-version 1 \
+              | jq -r '.packages[] | select(.name == "best-claude-hud") | .version'
+          )"
+          NPM_VERSION="$(node -p "require('./packaging/npm/package.json').version")"
+
+          if [ "$VERSION" != "$CARGO_VERSION" ] || [ "$VERSION" != "$NPM_VERSION" ]; then
+            echo "Release version mismatch:" >&2
+            echo "  requested: $VERSION" >&2
+            echo "  Cargo/Cargo.lock: $CARGO_VERSION" >&2
+            echo "  npm: $NPM_VERSION" >&2
+            exit 1
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    needs: validate-version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-14
+            archive: best-claude-hud-darwin-arm64.tar.gz
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+            archive: best-claude-hud-darwin-x64.tar.gz
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            archive: best-claude-hud-linux-x64-musl.tar.gz
+            musl: true
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: best-claude-hud-win32-x64.zip
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.target }}-release-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Fetch dependencies
+        shell: bash
+        run: |
+          for attempt in 1 2 3; do
+            cargo fetch --target "${{ matrix.target }}" && exit 0
+            echo "cargo fetch failed on attempt ${attempt}; retrying..."
+            sleep $((attempt * 10))
+          done
+          cargo fetch --target "${{ matrix.target }}"
+
+      - name: Install musl tools
+        if: matrix.musl == true
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package Unix
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/best-claude-hud" dist/best-claude-hud
+          tar -C dist -czf "${{ matrix.archive }}" best-claude-hud
+          if command -v shasum >/dev/null 2>&1; then
+            shasum -a 256 "${{ matrix.archive }}" > "${{ matrix.archive }}.sha256"
+          else
+            sha256sum "${{ matrix.archive }}" > "${{ matrix.archive }}.sha256"
+          fi
+
+      - name: Package Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/best-claude-hud.exe" "dist/best-claude-hud.exe"
+          Compress-Archive -Path "dist/best-claude-hud.exe" -DestinationPath "${{ matrix.archive }}" -Force
+          $hash = Get-FileHash -Algorithm SHA256 "${{ matrix.archive }}"
+          $checksumPath = "${{ matrix.archive }}.sha256"
+          $checksum = "$($hash.Hash.ToLower())  ${{ matrix.archive }}`n"
+          $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+          [System.IO.File]::WriteAllText($checksumPath, $checksum, $utf8NoBom)
+          if ([System.IO.File]::ReadAllBytes($checksumPath) -contains 13) {
+            throw "Checksum file contains a carriage return."
+          }
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ matrix.archive }}
+          path: |
+            ${{ matrix.archive }}
+            ${{ matrix.archive }}.sha256
+
+  npm-packages:
+    name: Build npm tarballs
+    runs-on: ubuntu-latest
+    needs: [validate-version, build]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Download release archives
+        uses: actions/download-artifact@v7
+        with:
+          path: release-artifacts
+          merge-multiple: true
+
+      - name: Check npm packaging
+        run: |
+          npm --prefix packaging/npm run check
+          npm --prefix packaging/npm run test
+
+      - name: Prepare npm packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.validate-version.outputs.version }}"
+
+          mkdir -p npm-tarballs
+          node packaging/npm/scripts/build-packages.js \
+            --version "$VERSION" \
+            --release-dir release-artifacts \
+            --output-dir npm-tarballs
+          (cd npm-tarballs && for file in *.tgz; do sha256sum "$file" > "$file.sha256"; done)
+
+      - name: Upload npm tarballs
+        uses: actions/upload-artifact@v6
+        with:
+          name: npm-tarballs
+          path: npm-tarballs/*
+
+  github-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: [build, npm-packages]
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: release-assets/**/*
+          draft: false
+          prerelease: false
+          body: |
+            ## best-claude-hud ${{ github.ref_name }}
+
+            Public release of `best-claude-hud`, a minimal Claude Code statusline HUD powered by Rust.
+
+            ### What's new in ${{ github.ref_name }}
+
+            - Plain mode uses its configured Usage icon, while Nerd Font and Powerline modes retain dynamic progress icons.
+            - The documentation now includes a complete Japanese guide, refreshed visuals, clearer setup and Nix ownership guidance, and explicit `@latest` npm commands.
+
+            ### Project highlights
+
+            - npm-first installation with platform-specific native binaries.
+            - Compact Claude Code statusline focused on model, workspace, Git state, and context usage.
+            - Live reasoning effort is shown as a distinct bright-purple item with a brain icon, including separate `xhigh`, `max`, and `ultracode` labels.
+            - Reasoning-mode cache upgrades fail closed so cancelled, overridden, or unknown `/effort` output cannot preserve stale Ultracode state.
+            - Model and reasoning effort use an explicit ASCII pipe separator across Plain, Nerd Font, Powerline, background, and non-background themes.
+            - Emoji-aware terminal width and complete ANSI resets prevent wrapping errors and style leakage.
+            - Workspace and Git status remain anchored to the Claude Code launch directory when skills, subagents, or shell commands change the temporary working directory.
+            - Context window parsing avoids reusing stale token data from older terminal sessions.
+            - Interrupted Claude Code responses no longer reset context usage to zero.
+            - Official Claude Code `context_window` data is preferred before transcript fallback.
+            - Claude Code `model` input supports both string and object forms.
+            - `rate_limits` are read from Claude Code statusLine stdin before API fallback.
+            - Project license is Apache-2.0 with upstream attribution preserved in `NOTICE`.
+
+            ### Install
+
+            ```bash
+            npm install -g best-claude-hud@latest
+            ```

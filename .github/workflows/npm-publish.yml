@@ -1,0 +1,63 @@
+name: npm publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish, for example 0.1.0"
+        required: true
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    name: Publish npm packages
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Download npm tarballs from GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          mkdir -p npm-tarballs
+          gh release download "v${VERSION#v}" \
+            --repo "${{ github.repository }}" \
+            --pattern "*.tgz" \
+            --dir npm-tarballs
+
+      - name: Publish platform package versions
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          VERSION="${VERSION#v}"
+          for platform in \
+            darwin-arm64 \
+            darwin-x64 \
+            linux-x64 \
+            win32-x64
+          do
+            npm publish "./npm-tarballs/best-claude-hud-npm-${platform}-${VERSION}.tgz" \
+              --tag "$platform" \
+              --provenance \
+              --access public \
+              --registry https://registry.npmjs.org
+          done
+
+      - name: Publish root package
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          VERSION="${VERSION#v}"
+          npm publish "./npm-tarballs/best-claude-hud-npm-${VERSION}.tgz" \
+            --provenance \
+            --access public \
+            --registry https://registry.npmjs.org
